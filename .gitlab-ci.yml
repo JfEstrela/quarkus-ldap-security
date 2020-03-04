@@ -1,0 +1,214 @@
+image: maven:3.6.0-jdk-8-alpine
+
+stages:
+  - prebuild
+  - testes
+  - mvn_deploy
+  - docker_build
+  - docker_deploy
+  - sonar
+
+
+variables:
+  temp_artifacts: artifacts.txt
+  GIT_SSL_NO_VERIFY: "true"
+
+before_script:
+    - REVISION_STABLE=${CI_COMMIT_TAG}
+    - REVISION_UNSTABLE=${CI_COMMIT_REF_SLUG}+sha.${CI_COMMIT_SHA:0:8}
+    - mkdir -p $HOME/.m2
+    - echo ${SETTINGS} > $HOME/.m2/settings.xml 
+    - MAVEN_CLI_OPTS="--batch-mode -s $HOME/.m2/settings.xml"
+
+cache:
+  paths:
+    - target/
+    
+artifacts:
+  stage: prebuild
+  script:
+    - rm -rf /usr/share/man && \
+    - rm -rf /var/cache/apk && \
+    - mkdir /var/cache/apk && \
+    - apk add perl
+    - mvn $MAVEN_CLI_OPTS org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout
+    - app_version=$(mvn $MAVEN_CLI_OPTS org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout)
+    - mvn $MAVEN_CLI_OPTS org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.artifactId -q -DforceStdout
+    - app_name=$(mvn $MAVEN_CLI_OPTS org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+    - container_deploy_image=$DOCKER_REGISTRY'/'$app_name:$app_version
+    - echo $app_version > version
+    - container_deploy_image_RC=$DOCKER_REGISTRY'/'$app_name:$(cat $(perl -i -pe 's/SNAPSHOT/RC/g' version) version)
+    - container_deploy_image_PRD=$DOCKER_REGISTRY'/'$app_name:$(cat $(perl -i -pe 's/-RC//g' version) version)
+    - app_version_final=$(cat version)
+    - echo -e $app_version'\n'$container_deploy_image'\n'$container_deploy_image_RC'\n'$container_deploy_image_PRD'\n'$app_version_final > ${temp_artifacts}
+    - echo $app_name
+    - echo $app_version
+    - echo $container_deploy_image
+    - echo $container_deploy_image_RC
+    - echo $container_deploy_image_PRD
+    - echo $app_version_final
+  tags:
+    - default
+  artifacts:
+    paths:
+      - ${temp_artifacts}
+    expire_in: 1 day
+  only:
+    - master
+    - release
+    - desenvolvimento     
+
+
+sonarqube:issues:
+  stage: prebuild
+  script:
+    - mvn $MAVEN_CLI_OPTS verify sonar:sonar -DskipTests=true -Dsonar.gitlab.ignore_certificate=true -Drevision=$REVISION_UNSTABLE -Dsonar.host.url=$SONAR_URL -Dsonar.login=$SONAR_LOGIN -Dsonar.gitlab.project_id=$CI_PROJECT_PATH -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA -Dsonar.gitlab.failure_notification_mode=exit-code -Dsonar.analysis.mode=issues
+  tags:
+    - default
+  only:
+    - desenvolvimento
+    - /^gsti\/.*/    
+
+mvn_test:
+   stage: testes
+   script:
+     - mvn $MAVEN_CLI_OPTS clean
+     - mvn $MAVEN_CLI_OPTS test
+     - echo run stage mvn_test  
+   tags:
+     - default 
+   only:
+    - desenvolvimento
+    - /^gsti\/.*/    
+     
+mvn_deploy:
+  stage: mvn_deploy
+  script:
+    - mvn $MAVEN_CLI_OPTS deploy -DskipTests=true
+    - echo run stage mvn_deploy 
+  tags:
+    - default
+  artifacts:
+    paths:
+      - target/
+  only:
+    - desenvolvimento 
+    
+mvn_deploy_final:
+  stage: mvn_deploy
+  script:
+    - mvn $MAVEN_CLI_OPTS versions:set -DremoveSnapshot
+    - mvn $MAVEN_CLI_OPTS deploy -DskipTests=true
+    - echo run stage mvn_deploy 
+  tags:
+    - default
+  only:
+    - master     
+
+build_push_docker:
+  stage: docker_build
+  image: docker:19
+  services:
+    - name: docker:19-dind 
+      command: ["--insecure-registry=${DOCKER_REGISTRY}"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - app_version=$(sed -n 1p ${temp_artifacts})
+    - echo $app_version 
+    - container_deploy_image=$(sed -n 2p ${temp_artifacts})
+    - echo $container_deploy_image
+  script:
+    - docker build -t $container_deploy_image .
+    - echo run build_docker 
+    - docker push $container_deploy_image
+    - echo run push_docker 
+  tags:
+    - default
+  only:
+    - desenvolvimento
+    
+build_push_docker_homologacao:
+  stage: docker_build
+  image: docker:19
+  services:
+    - name: docker:19-dind 
+      command: ["--insecure-registry=${DOCKER_REGISTRY}"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - container_deploy_image=$(sed -n 2p ${temp_artifacts})  
+    - container_deploy_image_RC=$(sed -n 3p ${temp_artifacts})
+    - echo $container_deploy_image_RC
+  dependencies:
+    - artifacts
+  script:
+    - docker pull  $container_deploy_image
+    - docker tag $container_deploy_image $container_deploy_image_RC 
+    - docker push $container_deploy_image_RC
+    - echo run stage deploy_docker_homologacao
+  tags:
+    - default
+  only:
+    - release
+    
+build_push_docker_producao:
+  stage: docker_build
+  image: docker:19
+  services:
+    - name: docker:19-dind 
+      command: ["--insecure-registry=${DOCKER_REGISTRY}"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - container_deploy_image=$(sed -n 2p ${temp_artifacts})    
+    - container_deploy_image_PRD=$(sed -n 4p ${temp_artifacts})
+    - echo $container_deploy_image_PRD
+  dependencies:
+    - artifacts
+  script:
+    - docker pull  $container_deploy_image
+    - docker tag $container_deploy_image $container_deploy_image_PRD
+    - docker push $container_deploy_image_PRD
+    - echo run stage deploy_docker_producao
+  tags:
+    - default    
+  only:
+    - master 
+
+deploy_docker:
+  stage: docker_deploy
+  dependencies: []  
+  script:
+    - curl -X POST $PORTAINER_HOOK_APP
+    - echo run stage deploy_docker
+  tags:
+    - default
+  only:
+    - desenvolvimento
+
+deploy_docker_homologacao:
+  stage: docker_deploy
+  dependencies: [] 
+  script:
+    - curl -X POST $PORTAINER_HOOK_APP_HOMOLOGACAO
+    - echo run stage deploy_docker_homologacao
+  tags:
+    - default   
+  only:
+    - release 
+
+deploy_docker_producao:
+  stage: docker_deploy
+  dependencies:
+    - artifacts
+  script:
+    - curl -X POST $PORTAINER_HOOK_APP_PRODUCAO
+    - echo run stage deploy_docker_producao
+  tags:
+    - default 
+  when: manual    
+  only:
+    - master 
+
+
